@@ -1,0 +1,5 @@
+bpy==5.2.2
+numpy
+scipy
+opencv-python-headless
+pillow

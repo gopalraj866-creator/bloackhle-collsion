@@ -1,0 +1,168 @@
+name: Render - What Happens When Two Black Holes Collide
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preview = 1 still per shot (fast check). full = render the whole 8-minute film"
+        type: choice
+        options: [preview, full]
+        default: preview
+      resolution:
+        description: "Output resolution"
+        type: choice
+        options: ["1080", "2160", "1080,2160"]
+        default: "1080"
+      fps:
+        description: "Frames per second (24 or 30)"
+        default: "24"
+      samples:
+        description: "Cycles samples per frame (denoised)"
+        default: "64"
+      shards:
+        description: "Parallel chunks per resolution (max 128)"
+        default: "96"
+      max_parallel:
+        description: "Concurrent runners (free plan allows 20)"
+        default: "20"
+      sky_res:
+        description: "NASA star-map resolution (8k or 16k)"
+        type: choice
+        options: ["8k", "16k"]
+        default: "8k"
+      publish_release:
+        description: "Also attach the final MP4 to a GitHub Release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  PY: "3.13"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PY }}", cache: pip }
+      - name: Cache assets
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: assets
+          key: assets-${{ inputs.sky_res }}-${{ inputs.fps }}-${{ hashFiles('scripts/download_assets.py', 'scripts/make_audio.py', 'scripts/config.py', 'scripts/physics.py') }}
+      - name: Install light deps
+        run: pip install numpy scipy opencv-python-headless pillow
+      - name: Download NASA star map + LIGO data
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python scripts/download_assets.py --out assets --sky-res ${{ inputs.sky_res }}
+      - name: Synthesise soundtrack and captions
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: scripts
+        run: python make_audio.py --out ../assets --assets ../assets
+      - name: Show asset sources
+        run: cat assets/sky_info.json; ls -la assets
+      - id: plan
+        run: |
+          if [ "${{ inputs.mode }}" = "preview" ]; then echo 'matrix={"include":[{"res":1080,"shard":0,"start":0,"end":1}]}' >> $GITHUB_OUTPUT;
+          else echo "matrix=$(python scripts/plan.py '${{ inputs.resolution }}' ${{ inputs.fps }} ${{ inputs.shards }})" >> $GITHUB_OUTPUT; fi
+
+  render:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PY }}", cache: pip }
+      - name: System packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core libgl1 libxrender1 libxi6 libxkbcommon0 libsm6
+      - name: Python packages (bpy = Blender as a module)
+        run: pip install -r requirements.txt
+      - uses: actions/cache/restore@v4
+        with:
+          path: assets
+          key: assets-${{ inputs.sky_res }}-${{ inputs.fps }}-${{ hashFiles('scripts/download_assets.py', 'scripts/make_audio.py', 'scripts/config.py', 'scripts/physics.py') }}
+          fail-on-cache-miss: true
+      - name: Preview stills (one per shot)
+        if: inputs.mode == 'preview'
+        working-directory: scripts
+        run: |
+          FR=$(python - <<'PY'
+          from config import SHOTS
+          print(",".join(str(int((s["t0"]+s["t1"])/2*${{ inputs.fps }})) for s in SHOTS))
+          PY
+          )
+          python render_shard.py --frames "$FR" --res 1080 --fps ${{ inputs.fps }} --samples ${{ inputs.samples }} --assets ../assets --out ../frames
+          python contact_sheet.py ../frames ../preview_sheet.png
+      - uses: actions/upload-artifact@v4
+        if: inputs.mode == 'preview'
+        with: { name: preview, path: "preview_sheet.png\nframes/*.png" }
+      - name: Render frames ${{ matrix.start }}-${{ matrix.end }} @ ${{ matrix.res }}p
+        if: inputs.mode == 'full'
+        working-directory: scripts
+        run: python render_shard.py --start ${{ matrix.start }} --end ${{ matrix.end }} --res ${{ matrix.res }} --fps ${{ inputs.fps }} --samples ${{ inputs.samples }} --assets ../assets --out ../frames
+      - name: Encode segment
+        if: inputs.mode == 'full'
+        run: |
+          CRF=14; [ "${{ matrix.res }}" = "2160" ] && CRF=17
+          ffmpeg -y -framerate ${{ inputs.fps }} -start_number ${{ matrix.start }} -i frames/f_%06d.png \
+            -c:v libx264 -preset veryfast -crf $CRF -pix_fmt yuv420p -g ${{ inputs.fps }} -bf 2 -x264-params scenecut=0:open-gop=0 \
+            -r ${{ inputs.fps }} seg.mp4
+      - uses: actions/upload-artifact@v4
+        if: inputs.mode == 'full'
+        with:
+          name: seg-${{ matrix.res }}-${{ matrix.shard }}
+          path: seg.mp4
+          retention-days: 2
+          compression-level: 0
+
+  assemble:
+    needs: [prepare, render]
+    if: inputs.mode == 'full'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        res: ${{ fromJSON(format('[{0}]', inputs.resolution)) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/cache/restore@v4
+        with:
+          path: assets
+          key: assets-${{ inputs.sky_res }}-${{ inputs.fps }}-${{ hashFiles('scripts/download_assets.py', 'scripts/make_audio.py', 'scripts/config.py', 'scripts/physics.py') }}
+          fail-on-cache-miss: true
+      - uses: actions/download-artifact@v4
+        with: { pattern: "seg-${{ matrix.res }}-*", path: segs }
+      - name: Concatenate + mux audio
+        run: |
+          ls segs | sort -t- -k3 -n | while read d; do echo "file 'segs/$d/seg.mp4'"; done > list.txt
+          ffmpeg -y -f concat -safe 0 -i list.txt -i assets/soundtrack.wav -map 0:v -map 1:a \
+            -c:v copy -c:a aac -b:a 256k -shortest -movflags +faststart \
+            What_Happens_When_Two_Black_Holes_Collide_${{ matrix.res }}p.mp4
+          cp assets/captions.srt .
+          ls -la *.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-${{ matrix.res }}p
+          path: |
+            What_Happens_When_Two_Black_Holes_Collide_${{ matrix.res }}p.mp4
+            captions.srt
+          retention-days: 7
+          compression-level: 0
+      - name: Attach to GitHub Release
+        if: inputs.publish_release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          TAG=bh-collision-run-${{ github.run_number }}
+          gh release view $TAG >/dev/null 2>&1 || gh release create $TAG --title "Black hole collision render #${{ github.run_number }}" --notes "Rendered by GitHub Actions"
+          gh release upload $TAG What_Happens_When_Two_Black_Holes_Collide_${{ matrix.res }}p.mp4 captions.srt --clobber
